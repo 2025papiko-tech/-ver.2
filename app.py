@@ -3,11 +3,11 @@ from faster_whisper import WhisperModel
 from phonemizer import phonemize
 import difflib
 import re
+from collections import defaultdict
 
-# モデルの読み込み（初回実行時に自動ダウンロードされます）
+# モデルの読み込み
 @st.cache_resource
 def load_model():
-    # "base"は軽量モデル。より高精度が必要なら"small"に変更可能
     return WhisperModel("base", device="cpu", compute_type="int8")
 
 model = load_model()
@@ -18,7 +18,6 @@ def get_ipa(text):
 
 def analyze_diff(script, transcript):
     """間違いを比較し、赤字で表示"""
-    # 記号を除去して小文字化
     s_words = re.sub(r'[.,!?—]', '', script.lower()).split()
     t_words = re.sub(r'[.,!?—]', '', transcript.lower()).split()
     
@@ -30,7 +29,7 @@ def analyze_diff(script, transcript):
     for word in diff:
         if word.startswith('  '):
             result_display.append(word[2:])
-        elif word.startswith('- '): # 台本にあるが読めなかった（またはミスした）単語
+        elif word.startswith('- '):
             error_count += 1
             w = word[2:]
             result_display.append(f"**:red[{w}]**")
@@ -38,21 +37,46 @@ def analyze_diff(script, transcript):
     
     return " ".join(result_display), error_count, errors
 
-# --- UI ---
-st.set_page_config(page_title="English Pronunciation AI", page_icon="🎤")
-st.title("🎤 AI英語発音・暗唱矯正アプリ")
-st.caption("OpenAI不要・完全無料。あなたのPC/サーバー内で解析します。")
+def extract_audio_changes(text):
+    """音声変化（リダクション・フラップT等）の抽出"""
+    text = text.lower()
+    changes = []
+    
+    # 1. 簡略化・リダクションのパターン
+    patterns = {
+        r"going to": "gonna (going toはgonnaと発音されやすい)",
+        r"want to": "wanna (want toはwannaと発音されやすい)",
+        r"got to": "gotta (got toはgottaと発音されやすい)",
+        r"kind of": "kinda (kind ofはkindaと発音されやすい)",
+    }
+    for p, desc in patterns.items():
+        if re.search(p, text):
+            changes.append(f"✅ **Reduction**: {desc}")
 
-col1, col2 = st.columns(2)
-with col1:
-    script_input = st.text_area("1. 正解の台本を入力", "Check it out at the end of the day.")
-with col2:
-    audio_file = st.file_uploader("2. 録音ファイルをアップロード", type=['mp3', 'wav', 'm4a'])
+    # 2. フラップT/D (母音に挟まれたT)
+    # 簡易的にbetter, water, started, excitingなどを抽出
+    flap_matches = re.findall(r'\b\w+[aeiou]t[aeiou]\w*\b', text)
+    if flap_matches:
+        unique_flaps = set(flap_matches)
+        changes.append(f"✅ **Flap T/D**: {', '.join(list(unique_flaps)[:3])}などは、Tの音が濁って『d』や『l』に近い音になります(better→beder現象)。")
+
+    # 3. リンキング (子音 + 母音)
+    linking_matches = re.findall(r'\b\w*[^aeiou] [aeiou]\w*\b', text)
+    if linking_matches:
+        changes.append(f"✅ **Linking**: {' / '.join(linking_matches[:2])}などは、前の単語の最後と次の単語の頭を繋げて発音しましょう。")
+
+    return changes
+
+# --- UI ---
+st.set_page_config(page_title="English Pronunciation Coach", page_icon="🎤")
+st.title("🎤 AI英語発音・暗唱矯正アプリ")
+
+script_input = st.text_area("1. 正解の台本を入力", height=200)
+audio_file = st.file_uploader("2. 録音ファイルをアップロード", type=['mp3', 'wav', 'm4a'])
 
 if st.button("分析を実行"):
     if audio_file and script_input:
-        with st.spinner("音声を解析中..."):
-            # 一時ファイルとして保存
+        with st.spinner("音声を精密解析中..."):
             with open("temp_audio.mp3", "wb") as f:
                 f.write(audio_file.read())
             
@@ -60,59 +84,63 @@ if st.button("分析を実行"):
             transcript_text = " ".join([segment.text for segment in segments])
             confidence = info.language_probability * 100
 
-        # 分析実行
         display_text, err_count, err_list = analyze_diff(script_input, transcript_text)
 
         st.subheader("📊 分析結果")
         st.markdown(f"**添削結果 (赤字がミス):**\n\n{display_text}")
         
-        st.divider()
-        
         col_res1, col_res2 = st.columns(2)
         col_res1.metric("間違い箇所", f"{err_count} 単語")
         col_res2.metric("発音明瞭度", f"{confidence:.1f}%")
 
-        # 音声変化アドバイス
-        st.subheader("🔗 音声変化(Linking/Reduction)のコツ")
-        tips = []
-        if "it out" in script_input.lower(): tips.append("・**it out**: 't'がラ行化して『イラウト』のように繋がります(Flap T)。")
-        if "at the" in script_input.lower(): tips.append("・**at the**: 't'を飲み込み『アッダ』のように発音するとスムーズです。")
-        if "check it" in script_input.lower(): tips.append("・**check it**: 'k'と'i'が繋がって『チェキッ』になります(Linking)。")
-        
-        if tips:
-            for tip in tips: st.write(tip)
+        # --- 音声変化セクション ---
+        st.subheader("🔗 意識すべき音声変化")
+        audio_changes = extract_audio_changes(script_input)
+        if audio_changes:
+            for change in audio_changes:
+                st.write(change)
         else:
-            st.write("単語同士を繋げる意識で話すとより自然になります。")
+            st.write("特に顕著な音声変化パターンは見つかりませんでしたが、単語同士を滑らかに繋げる意識を持ちましょう。")
 
-        # 音素分析の改善
+        # --- 音素パターン別セクション ---
         if err_list:
-            st.subheader("🔤 苦手な音の集中解説")
-            st.write("ミスした単語に含まれる、注意すべき音素です。")
+            st.subheader("🔤 苦手な音のパターン別解説")
+            st.write("ミスした単語を原因別にまとめました。優先的に復習しましょう。")
             
-            # 重複を除去して分析
-            for err in sorted(set(err_list)):
+            pattern_groups = defaultdict(list)
+            
+            for err in set(err_list):
                 ipa = get_ipa(err).strip()
-                st.write(f"---")
-                st.write(f"単語: **{err}** `/{ipa}/`")
+                item = f"{err} [/{ipa}/]"
                 
-                # 具体的な発音アドバイスの分岐
                 if 'l' in ipa:
-                    st.success("💡 **Lの音**: 舌先を上の前歯の付け根にしっかり押し当てて、パッと「弾く」ように離して！")
-                
+                    pattern_groups['Lの音（弾く音）'].append(item)
                 if 'ɹ' in ipa or 'r' in ipa:
-                    st.warning("💡 **Rの音**: 舌をどこにも付けず、喉の奥に引いて「ウー」に近い音でこもらせて。")
-                
+                    pattern_groups['Rの音（こもる音）'].append(item)
                 if 'ð' in ipa or 'θ' in ipa:
-                    st.info("💡 **THの音**: 舌先を前歯で軽く挟むか、裏側に触れさせて空気を漏らして。")
-                
-                if 'v' in ipa:
-                    st.info("💡 **Vの音**: 上の前歯で下唇を軽く押さえて、震わせながら音を出して。")
-                
+                    pattern_groups['THの音（摩擦音）'].append(item)
+                if 'v' in ipa or 'f' in ipa:
+                    pattern_groups['V/Fの音（唇を噛む音）'].append(item)
                 if 'æ' in ipa:
-                    st.info("💡 **エとアの中間音**: 口を左右に大きく開けて「ア」と言うつもりで「エ」を出してみて。")
+                    pattern_groups['アとエの中間音（æ）'].append(item)
 
+            # カテゴリごとに表示
+            for category, words in pattern_groups.items():
+                with st.expander(f"📌 {category} - {len(words)}単語"):
+                    if 'L' in category:
+                        st.success("💡 **解説**: 舌先を前歯の付け根に強く押し当て、離す瞬間に「パッ」と弾きます。")
+                    elif 'R' in category:
+                        st.warning("💡 **解説**: 舌をどこにも触れさせず、奥に引いて喉を鳴らすイメージです。")
+                    elif 'TH' in category:
+                        st.info("💡 **解説**: 舌先を前歯で軽く挟むか、隙間から息を強く漏らします。")
+                    elif 'V' in category:
+                        st.info("💡 **解説**: 上の前歯で下唇を軽く押さえ、振動させながら息を出します。")
+                    elif 'æ' in category:
+                        st.info("💡 **解説**: 指二本分くらい口を縦横に大きく開け、アとエを同時に言う音です。")
+                    
+                    st.write("対象単語: " + " / ".join(words))
     else:
         st.error("台本と音声ファイルを両方準備してください。")
 
 st.divider()
-st.caption("Tips: THE BAWDIESのようなガレージロックを歌う際は、'R'や'V'の音を強調するとよりエネルギッシュに聞こえます！")
+st.caption("Pro-tip: 好きなバンドの歌詞を台本にすると、より感情を乗せた発音練習ができます。")
